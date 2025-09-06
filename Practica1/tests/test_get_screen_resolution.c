@@ -4,7 +4,7 @@
 #include <sys/syscall.h>
 #include <errno.h>
 
-#define SYS_GET_SCREEN_RESOLUTION 550
+#define SYS_GET_SCREEN_RESOLUTION 465
 
 int main() {
     int width = 0, height = 0;

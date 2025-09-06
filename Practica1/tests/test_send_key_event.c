@@ -3,7 +3,7 @@
 #include <sys/syscall.h>
 #include <errno.h>
 
-#define SYS_SEND_KEY_EVENT 549
+#define SYS_SEND_KEY_EVENT 464
 
 #define KEY_A 30
 #define KEY_B 48

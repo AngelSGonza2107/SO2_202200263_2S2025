@@ -393,6 +393,14 @@
 464 common  send_key_event  sys_send_key_event
 465 common  get_screen_resolution  sys_get_screen_resolution
 
+# Syscalls personalizadas (Practica 2)
+
+466 common capture_screen sys_capture_screen
+467 common ipc_channel_send sys_ipc_channel_send
+468 common ipc_channel_receive sys_ipc_channel_receive
+469 common start_log_watch sys_start_log_watch
+470 common stop_log_watch sys_stop_log_watch
+
 #
 # Due to a historical design error, certain syscalls are numbered differently
 # in x32 as compared to native x86_64.  These syscalls have numbers 512-547.

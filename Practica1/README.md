@@ -2,7 +2,7 @@
 
 ## 🧾 Descripción General
 
-Este documento describe el proceso completo para la creación de syscalls personalizadas , los cuales permiten realizar diferentes funcinalidades básicas en el sistema, como el control del mouse, la obtención de información relevante de la pantalla y otros. Algunas de estas syscalls interactúan con dispositivos de entrada virtual registrado en el subsistema de entrada del kernel de Linux.
+Este documento describe el proceso completo para la creación de syscalls personalizadas, las cuales permiten realizar diferentes funcinalidades básicas en el sistema, como el control del mouse, la obtención de información relevante de la pantalla y otros. Algunas de estas syscalls interactúan con dispositivos de entrada virtual registrado en el subsistema de entrada del kernel de Linux.
 
 ---
 
@@ -80,10 +80,10 @@ input_sync(virtual_mouse);
 
 #### 3. **Asignación del Número de Syscall**
 
-Se definió el número de syscall como `548` en el espacio de usuario:
+Se definió el número de syscall como `463` en el espacio de usuario:
 
 ```c
-#define SYS_MOVE_MOUSE 548
+#define SYS_MOVE_MOUSE 463
 ```
 
 > ⚠️ Este número debe coincidir con el que se haya asignado en el archivo `syscall_64.tbl` del kernel.
@@ -97,7 +97,7 @@ Se modificaron los siguientes archivos para registrar la nueva syscall:
 Agregar la entrada:
 
 ```
-548     common   move_mouse     sys_move_mouse
+463     common   move_mouse     sys_move_mouse
 ```
 
 ##### 📁 `kernel/sys_move_mouse.c`
@@ -121,7 +121,7 @@ Se creó un programa en C para probar la syscall:
 #include <sys/syscall.h>
 #include <errno.h>
 
-#define SYS_MOVE_MOUSE 548
+#define SYS_MOVE_MOUSE 463
 
 int main() {
     int dx = 20;
@@ -220,10 +220,10 @@ input_sync(virtual_keyboard);
 
 ### 3. **Asignación del Número de Syscall**
 
-Se definió el número de syscall como `549` en el espacio de usuario:
+Se definió el número de syscall como `464` en el espacio de usuario:
 
 ```c
-#define SYS_SEND_KEY_EVENT 549
+#define SYS_SEND_KEY_EVENT 464
 ```
 
 > ⚠️ Este número debe coincidir con el que se haya asignado en el archivo `arch/x86/entry/syscalls/syscall_64.tbl` del kernel.
@@ -240,7 +240,7 @@ Se creó un programa en C para probar la syscall:
 #include <sys/syscall.h>
 #include <errno.h>
 
-#define SYS_SEND_KEY_EVENT 549
+#define SYS_SEND_KEY_EVENT 464
 
 #define KEY_A 30
 #define KEY_B 48
@@ -361,10 +361,10 @@ Si no se encontró un conector válido, se retorna `-ENODEV`.
 
 ### 4. **Asignación del Número de Syscall**
 
-Se definió el número de syscall como `550` en el espacio de usuario:
+Se definió el número de syscall como `465` en el espacio de usuario:
 
 ```c
-#define SYS_GET_SCREEN_RESOLUTION 550
+#define SYS_GET_SCREEN_RESOLUTION 465
 ```
 
 > ⚠️ Este número debe coincidir con el definido en `arch/x86/entry/syscalls/syscall_64.tbl`.
@@ -385,7 +385,7 @@ Se creó un programa en C para invocar la syscall y mostrar la resolución:
 #include <fcntl.h>
 #include <errno.h>
 
-#define SYS_GET_SCREEN_RESOLUTION 550
+#define SYS_GET_SCREEN_RESOLUTION 465
 
 int main() {
     int fd = open("/dev/dri/card0", O_RDWR);

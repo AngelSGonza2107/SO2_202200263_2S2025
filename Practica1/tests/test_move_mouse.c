@@ -3,7 +3,7 @@
 #include <sys/syscall.h>
 #include <errno.h>
 
-#define SYS_MOVE_MOUSE 548
+#define SYS_MOVE_MOUSE 463
 
 int main() {
     int dx = 60;
