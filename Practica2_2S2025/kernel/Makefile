@@ -14,11 +14,7 @@ obj-y     = fork.o exec_domain.o panic.o \
 		move_mouse.o \
 		send_key_event.o \
 		get_screen_resolution.o \
-		capture_screen.o \
-		ipc_channel_send.o \
-		ipc_channel_receive.o \
-		start_log_watch.o \
-		stop_log_watch.o
+		log_watch.o
 
 obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
 obj-$(CONFIG_MULTIUSER) += groups.o

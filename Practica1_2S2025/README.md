@@ -149,10 +149,10 @@ sudo ./test_mouse
 
 > 🔒 Se requiere privilegios de superusuario para acceder al sistema de entrada.
 
-![move_mouse1](/Practica1/assets/mouse1.png)
-![move_mouse2](/Practica1/assets/mouse2.png)
+![move_mouse1](/Practica1_2S2025/assets/mouse1.png)
+![move_mouse2](/Practica1_2S2025/assets/mouse2.png)
 
-![evtest_mouse](/Practica1/assets/evtest1.png)
+![evtest_mouse](/Practica1_2S2025/assets/evtest1.png)
 
 ---
 
@@ -261,9 +261,9 @@ int main() {
 }
 ```
 
-![send_key_event](/Practica1/assets/key_event.png)
+![send_key_event](/Practica1_2S2025/assets/key_event.png)
 
-![evtest_key_event](/Practica1/assets/evtest2.png)
+![evtest_key_event](/Practica1_2S2025/assets/evtest2.png)
 
 ---
 
@@ -409,7 +409,7 @@ int main() {
 }
 ```
 
-![get_screen_resolution](/Practica1/assets/resolucion.png)
+![get_screen_resolution](/Practica1_2S2025/assets/resolucion.png)
 
 ---
 

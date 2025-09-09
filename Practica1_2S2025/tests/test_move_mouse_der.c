@@ -6,8 +6,8 @@
 #define SYS_MOVE_MOUSE 463
 
 int main() {
-    int dx = 60;
-    int dy = 80;
+    int dx = 200;
+    int dy = 100;
     long res = syscall(SYS_MOVE_MOUSE, dx, dy);
     if (res == 0)
         printf("Movimiento del mouse simulado: dx=%d, dy=%d\n", dx, dy);
