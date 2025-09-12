@@ -1,137 +1,214 @@
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
-#include <linux/errno.h>
-#include <linux/printk.h>
-#include <linux/mutex.h> // Necesario para el mutex
-
-// Cabeceras DRM necesarias
-#include <drm/drm_drv.h>
+#include <linux/vmalloc.h>
+#include <linux/fb.h>
 #include <drm/drm_device.h>
-#include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
+#include <drm/drm_plane.h>
 #include <drm/drm_framebuffer.h>
-#include <drm/drm_gem.h>
-#include <drm/drm_fourcc.h>
+#include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_fb_helper.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_modeset_lock.h>
+#include <linux/iosys-map.h>
 
-// Símbolos externos para el método antiguo
-extern struct mutex drm_core_lock;
-extern struct list_head drm_device_list;
+extern struct fb_info *registered_fb[];
+extern int num_registered_fb;
 
-// Incluye la definición de la estructura (versión del kernel)
-struct screen_capture {
-    __u32 width;
-    __u32 height;
-    __u32 bpp;
-    __u64 buffer_size;
-    void __user *buffer;
+// Estructura para pasar datos entre el espacio de usuario y el kernel
+struct capture_struct {
+    __u64 data_pointer;      // Dirección de memoria del usuario para la captura
+    __u64 data_size;         // Tamaño máximo del buffer del usuario
+    __u32 width;             // Ancho de la imagen
+    __u32 height;            // Alto de la imagen
+    __u32 bytes_per_row;     // Bytes por fila
+    __u32 bytes_per_pixel;   // Bytes por pixel
+    __u32 drm_format;        // Formato DRM de la imagen
+    __u32 total_bytes;       // Tamaño real de la captura
 };
 
-SYSCALL_DEFINE1(capture_screen, struct screen_capture __user *, user_capture)
-{
-    struct screen_capture k_capture;
-    struct drm_device *drm_dev = NULL;
-    struct drm_device *found_drm_dev = NULL; // Para gestionar la referencia
-    struct drm_framebuffer *fb = NULL;
-    struct drm_gem_object *gem_obj = NULL;
-    void *vaddr = NULL;
-    size_t fb_size;
-    int ret = 0;
+/**
+ * Obtiene el dispositivo DRM asociado al framebuffer /dev/fb0
+ *
+ * regresa un puntero al struct drm_device o NULL si no se encuentra
+ */
+static struct drm_device *get_drm_device_from_fb0(void) {
+    // Verifica si hay framebuffers registrados y si el primero existe
+    if (num_registered_fb <= 0 || !registered_fb[0])
+        return NULL;
 
-    if (copy_from_user(&k_capture, user_capture, sizeof(k_capture))) {
-        return -EFAULT;
+    struct fb_info *info = registered_fb[0];
+    // Intenta obtener el helper de fb y luego el dispositivo DRM
+    struct drm_fb_helper *helper = (struct drm_fb_helper *)info->par;
+    return helper ? helper->dev : NULL;
+}
+
+/**
+ * Busca el framebuffer primario y su CRTC
+ *
+ * drm: Dispositivo DRM
+ * crtc_out: Puntero para almacenar el CRTC encontrado
+ * fb_out: Puntero para almacenar el framebuffer encontrado
+ * w: Puntero para almacenar el ancho
+ * h: Puntero para almacenar el alto
+ * devuelve 0 si tiene éxito
+ */
+static int get_primary_fb(struct drm_device *drm, struct drm_crtc **crtc_out,
+                          struct drm_framebuffer **fb_out, u32 *w, u32 *h) {
+    struct drm_modeset_acquire_ctx ctx;
+    int ret;
+
+    // Inicializa el contexto para bloquear el DRM
+    drm_modeset_acquire_init(&ctx, 0);
+
+    // Bucle para intentar obtener los bloqueos DRM
+retry:
+    ret = drm_modeset_lock_all_ctx(drm, &ctx);
+    if (ret == -EDEADLK) {
+        drm_modeset_backoff(&ctx);
+        goto retry;
     }
+    if (ret)
+        goto out;
 
-    if (!k_capture.buffer || k_capture.buffer_size == 0) {
-        return -EINVAL;
-    }
-
-    // --- INICIO DE LA LÓGICA PARA KERNELS ANTIGUOS (4.x) ---
-    // 1. Bloquear la lista de dispositivos para una iteración segura
-    mutex_lock(&drm_core_lock);
-
-    // 2. Iterar sobre la lista global de dispositivos DRM
-    list_for_each_entry(drm_dev, &drm_device_list, dev_list) {
-        struct drm_connector *connector;
-        struct drm_connector_list_iter conn_iter;
-
-        // 3. Incrementar el contador de referencias manualmente
-        drm_dev_get(drm_dev);
-
-        drm_connector_list_iter_begin(drm_dev, &conn_iter);
-        drm_for_each_connector_iter(connector, &conn_iter) {
-            if (connector->state && connector->state->crtc) {
-                struct drm_crtc *crtc = connector->state->crtc;
-                if (crtc->primary && crtc->primary->state && crtc->primary->state->fb) {
-                    fb = crtc->primary->state->fb;
-                    found_drm_dev = drm_dev; // Guardamos el dispositivo que encontramos
-                    goto found_and_unlock;
-                }
-            }
+    // Itera sobre los conectores para encontrar el CRTC activo
+    struct drm_connector *conn;
+    struct drm_crtc *crtc = NULL;
+    struct drm_connector_list_iter iter;
+    drm_connector_list_iter_begin(drm, &iter);
+    drm_for_each_connector_iter(conn, &iter) {
+        if (conn->status == connector_status_connected && conn->state && conn->state->crtc) {
+            crtc = conn->state->crtc;
+            break;
         }
-        drm_connector_list_iter_end(&conn_iter);
-
-        // Si no se encontró, liberamos la referencia de este dispositivo
-        drm_dev_put(drm_dev);
     }
-    // Si terminamos el bucle sin encontrar nada, desbloqueamos y salimos
-    mutex_unlock(&drm_core_lock);
-    pr_err("capture_screen: No se encontró un framebuffer activo.\n");
-    return -ENODEV;
+    drm_connector_list_iter_end(&iter);
 
-found_and_unlock:
-    // 4. Desbloquear la lista tan pronto como sea posible
-    mutex_unlock(&drm_core_lock);
-    // --- FIN DE LA LÓGICA PARA KERNELS ANTIGUOS ---
-
-    // 5. Calcular tamaño y validar buffer
-    fb_size = (size_t)fb->width * fb->height * (fb->bits_per_pixel / 8);
-
-    if (k_capture.buffer_size < fb_size) {
-        ret = -EINVAL;
-        goto cleanup;
-    }
-    
-    // 6. Obtener objeto GEM y mapearlo
-    gem_obj = fb->obj[0];
-    if (!gem_obj) {
+    if (!crtc) {
         ret = -ENODEV;
-        goto cleanup;
-    }
-    
-    vaddr = drm_gem_object_vmap(gem_obj);
-    if (IS_ERR(vaddr)) {
-        ret = PTR_ERR(vaddr);
-        vaddr = NULL; // Importante para el cleanup
-        goto cleanup;
+        goto unlock;
     }
 
-    // 7. Copiar los datos al usuario
-    if (copy_to_user(k_capture.buffer, vaddr, fb_size)) {
+    // Busca el plane (imagen lista para enviar a CRTC) primario asociado al CRTC
+    struct drm_plane *plane;
+    drm_for_each_plane(plane, drm) {
+        if (plane->type == DRM_PLANE_TYPE_PRIMARY && plane->state &&
+            plane->state->fb && plane->state->crtc == crtc) {
+            // Se encontró el framebuffer primario
+            drm_framebuffer_get(plane->state->fb);
+            *crtc_out = crtc;
+            *fb_out = plane->state->fb;
+            *w = crtc->state->mode.hdisplay;
+            *h = crtc->state->mode.vdisplay;
+            ret = 0;
+            goto unlock;
+        }
+    }
+    ret = -ENODEV;
+
+unlock:
+    drm_modeset_drop_locks(&ctx);
+out:
+    drm_modeset_acquire_fini(&ctx);
+    return ret;
+}
+
+/**
+ * Implementa la llamada al sistema para capturar la pantalla
+ *
+ * user_c_struct: Puntero a la estructura de usuario con los parámetros
+ * devuelve 0 si tiene éxito, o un código de error
+ */
+SYSCALL_DEFINE1(capture_screen, struct capture_struct __user *, user_c_struct) {
+    struct capture_struct c_struct;
+    // Copia la estructura del espacio de usuario al kernel
+    if (copy_from_user(&c_struct, user_c_struct, sizeof(c_struct)))
+        return -EFAULT;
+
+    // Obtiene el dispositivo DRM.
+    struct drm_device *drm = get_drm_device_from_fb0();
+    if (!drm)
+        return -ENODEV;
+
+    // Busca el framebuffer principal
+    struct drm_crtc *crtc = NULL;
+    struct drm_framebuffer *fb = NULL;
+    u32 width, height;
+    int ret = get_primary_fb(drm, &crtc, &fb, &width, &height);
+    if (ret)
+        return ret;
+
+    // Verifica si el formato del framebuffer es compatible
+    if (fb->modifier != DRM_FORMAT_MOD_LINEAR && fb->modifier != DRM_FORMAT_MOD_INVALID) {
+        drm_framebuffer_put(fb);
+        return -EOPNOTSUPP;
+    }
+
+    u32 pitch = fb->pitches[0];
+    u32 bpp = fb->format->cpp[0] * 8;
+    u32 format = fb->format->format;
+    size_t total_bytes = (size_t)pitch * height;
+
+    // Si el buffer de usuario es demasiado pequeño, se devuelve el tamaño requerido
+    if (c_struct.data_size < total_bytes) {
+        c_struct.width = width;
+        c_struct.height = height;
+        c_struct.bytes_per_row = pitch;
+        c_struct.bytes_per_pixel = bpp / 8;
+        c_struct.drm_format = format;
+        c_struct.total_bytes = total_bytes;
+        copy_to_user(user_c_struct, &c_struct, sizeof(c_struct));
+        drm_framebuffer_put(fb);
+        return -ENOSPC;
+    }
+
+    // Mapea la memoria del framebuffer al espacio de direcciones del kernel
+    struct iosys_map map[DRM_FORMAT_MAX_PLANES];
+    ret = drm_gem_fb_vmap(fb, map, NULL);
+    if (ret) {
+        drm_framebuffer_put(fb);
+        return ret;
+    }
+
+    const u8 *vbase = (const u8 *)map[0].vaddr + fb->offsets[0];
+    
+    // Asigna un buffer temporal en el kernel y copia los datos
+    void *tmp = vmalloc(total_bytes);
+    if (!tmp) {
+        ret = -ENOMEM;
+        goto vunmap;
+    }
+
+    // Copia los datos del framebuffer al buffer temporal
+    for (u32 y = 0; y < height; ++y) {
+        memcpy((u8 *)tmp + (size_t)pitch * y, vbase + (size_t)pitch * y, pitch);
+    }
+
+    // Copia los datos capturados del buffer temporal al espacio de usuario
+    if (copy_to_user((void __user *)(uintptr_t)c_struct.data_pointer, tmp, total_bytes)) {
         ret = -EFAULT;
-        goto cleanup;
+        goto vfree;
     }
 
-    // 8. Actualizar la estructura del usuario con la información
-    k_capture.width = fb->width;
-    k_capture.height = fb->height;
-    // CORRECCIÓN: Usar el miembro directo de la estructura antigua
-    k_capture.bpp = fb->bits_per_pixel;
-
-    if (copy_to_user(user_capture, &k_capture, sizeof(k_capture))) {
+    // Actualiza la estructura de usuario con los valores reales
+    c_struct.width = width;
+    c_struct.height = height;
+    c_struct.bytes_per_row = pitch;
+    c_struct.bytes_per_pixel = bpp / 8;
+    c_struct.drm_format = format;
+    c_struct.total_bytes = total_bytes;
+    
+    // Copia la estructura de vuelta al espacio de usuario
+    if (copy_to_user(user_c_struct, &c_struct, sizeof(c_struct)))
         ret = -EFAULT;
-        goto cleanup;
-    }
-    
-    ret = 0; // Éxito
 
-cleanup:
-    if (vaddr) {
-        drm_gem_object_vunmap(gem_obj, vaddr);
-    }
-    // 9. Liberar la referencia del dispositivo que encontramos
-    if (found_drm_dev) {
-        drm_dev_put(found_drm_dev);
-    }
-    
+// Si alguna función falla, se salta a las etiquetas para liberar recursos
+// Libera meemoria si se uso vmalloc()
+vfree:
+    vfree(tmp);
+// Desmapea la memoria del framebuffer si se uso drm_gem_fb_vmap()
+vunmap:
+    drm_gem_fb_vunmap(fb, map);
+    drm_framebuffer_put(fb);
     return ret;
 }

@@ -395,7 +395,7 @@
 
 # Syscalls personalizadas (Practica 2)
 
-# 466 common capture_screen sys_capture_screen
+466 common capture_screen sys_capture_screen
 # 467 common ipc_channel_send sys_ipc_channel_send
 # 468 common ipc_channel_receive sys_ipc_channel_receive
 469 common start_log_watch sys_start_log_watch

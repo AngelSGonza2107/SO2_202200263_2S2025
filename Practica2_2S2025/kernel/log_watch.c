@@ -1,213 +1,301 @@
-#include <linux/syscalls_usac.h> // Usamos tu header
-#include <linux/delay.h>
+#include <linux/kernel.h>
+#include <linux/syscalls.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
+#include <linux/string.h>
+#include <linux/idr.h>
 
-// Estructura para mantener el estado de cada archivo monitoreado (su última posición de lectura)
-struct file_state {
+// IDR y mutex para gestionar los contextos de monitoreo
+static DEFINE_IDR(context_idr);
+static DEFINE_MUTEX(context_idr_lock);
+
+// Estructura que representa un archivo a monitorear
+// Esto con el fin de poder leer varios archivos en un solo contexto
+struct log_file {
+    struct file *file;
     char *path;
-    loff_t pos;
-};
-
-// Modificamos la estructura principal para incluir el estado de los archivos
-struct log_watch {
-    struct task_struct *thread;
+    loff_t last_pos;
     struct list_head list;
-    bool stop;
-    int id;
-    struct mutex lock;
-
-    // Parámetros copiados al kernel
-    int num_files;
-    struct file_state *files; // Array con las rutas y sus posiciones
-    char *central_log;
-    char *keyword;
 };
 
-static LIST_HEAD(log_watch_list);
-static DEFINE_MUTEX(global_list_lock);
-static atomic_t next_id = ATOMIC_INIT(1); // Usamos atomic_t para seguridad en concurrencia
+// Estructura del contexto de monitoreo. Contiene toda la información necesaria para el hilo de monitoreo
+// - La lista de archivos a monitorear list_head files
+// - El archivo central de logs log_file
+// - La palabra clave a buscar keyword
+// - Un mutex para proteger el acceso a la lista de archivos lock
+// - Una wait queue para dormir el hilo waitq
+// Finalmente un ID único id
+struct thread_ctx {
+    u32 id;
+    struct list_head files;
+    struct mutex lock;
+    struct task_struct *thread;
+    wait_queue_head_t waitq;
+    bool stop;
+    struct file *log_file;
+    char keyword[128];
+    size_t keyword_len;
+};
 
-// Hilo de monitoreo mejorado
-static int watch_thread(void *data) {
-    struct log_watch *lw = (struct log_watch *)data;
-    char *buf;
-    int i;
-
-    // Buffer de 2KB para leer los logs
-    buf = kmalloc(2048, GFP_KERNEL);
-    if (!buf) {
-        pr_err("log_watch: No se pudo asignar memoria para el buffer de lectura\n");
-        return -ENOMEM;
-    }
-
-    // El bucle principal se detiene si se llama a kthread_stop()
-    while (!kthread_should_stop()) {
-        for (i = 0; i < lw->num_files; i++) {
-            struct file *f;
-            ssize_t bytes_read;
-
-            // Abrimos el archivo a monitorear
-            f = filp_open(lw->files[i].path, O_RDONLY, 0);
-            if (IS_ERR(f)) continue;
-
-            // Leemos desde la última posición conocida
-            while ((bytes_read = kernel_read(f, buf, 2047, &lw->files[i].pos)) > 0) {
-                // CORRECCIÓN: Usamos bytes_read para terminar la cadena correctamente
-                buf[bytes_read] = '\0';
-
-                // Si encontramos la palabra clave
-                if (strstr(buf, lw->keyword)) {
-                    struct file *central;
-                    char outbuf[2560]; // Buffer más grande para el mensaje de salida
-                    loff_t central_pos = 0;
-
-                    // Abrimos el log central en modo de añadir (append)
-                    central = filp_open(lw->central_log, O_WRONLY | O_APPEND | O_CREAT, 0644);
-                    if (IS_ERR(central)) {
-                        pr_warn("log_watch: No se pudo abrir el log central %s\n", lw->central_log);
-                        continue;
-                    }
-                    
-                    // Creamos el mensaje a escribir
-                    snprintf(outbuf, sizeof(outbuf),
-                             "[ORIGEN: %s] [KEYWORD: %s] --- LOG: %s\n",
-                             lw->files[i].path, lw->keyword, buf);
-                    
-                    // Escribimos en el log central
-                    kernel_write(central, outbuf, strlen(outbuf), &central->f_pos);
-                    filp_close(central, NULL);
-                }
-            }
-            filp_close(f, NULL);
+// Hilo del kernel que ejecuta el monitoreo para un contexto específico.
+static int monitor_thread(void *data) {
+    struct thread_ctx *ctx = data;
+    struct log_file *fw;
+    
+    while (!kthread_should_stop() && !READ_ONCE(ctx->stop)) {
+        mutex_lock(&ctx->lock);
+        list_for_each_entry(fw, &ctx->files, list) {
+            monitor_file(ctx, fw);
         }
-        // Esperamos 2 segundos antes de la siguiente revisión
-        msleep(2000);
+        mutex_unlock(&ctx->lock);
+        
+        wait_event_interruptible_timeout(ctx->waitq, READ_ONCE(ctx->stop) || kthread_should_stop(), msecs_to_jiffies(2000));
     }
-
-    kfree(buf);
-    pr_info("log_watch: Hilo %d detenido.\n", lw->id);
     return 0;
 }
 
-// ------ Syscalls ------
+// Escribe un mensaje de log en el archivo central
+static int write_to_central_log(struct thread_ctx *ctx, const char *src_path, const char *line, size_t len) {
+    size_t path_len = strlen(src_path);
+    size_t bufsize = path_len + ctx->keyword_len + len + 50;
+    char *buffer = kmalloc(bufsize, GFP_KERNEL);
+    if (!buffer) return -ENOMEM;
 
-SYSCALL_DEFINE1(start_log_watch, struct log_watch_params __user *, user_params) {
-    struct log_watch *lw;
-    struct log_watch_params params_from_user;
-    int i;
+    size_t written = snprintf(buffer, bufsize, "%s - Palabra '%s' encontrada en el log '%.*s'\n",
+                              src_path, ctx->keyword, (int)len, line);
 
-    // 1. Asignar memoria en el kernel para la estructura principal
-    lw = kzalloc(sizeof(struct log_watch), GFP_KERNEL);
-    if (!lw) return -ENOMEM;
-
-    // 2. Copiar la estructura de parámetros (que contiene punteros) desde el usuario
-    if (copy_from_user(&params_from_user, user_params, sizeof(struct log_watch_params))) {
-        kfree(lw);
-        return -EFAULT;
+    mutex_lock(&ctx->lock);
+    loff_t pos = ctx->log_file->f_pos;
+    int ret = kernel_write(ctx->log_file, buffer, written, &pos);
+    if (ret > 0) {
+        ctx->log_file->f_pos = pos;
+        ret = 0;
     }
-    
-    lw->num_files = params_from_user.num_files;
+    mutex_unlock(&ctx->lock);
 
-    // 3. Copiar la RUTA DEL LOG CENTRAL (string) del usuario al kernel
-    lw->central_log = kstrndup_from_user(params_from_user.central_log, 256, GFP_KERNEL);
-    if (IS_ERR(lw->central_log)) {
-        kfree(lw);
-        return PTR_ERR(lw->central_log);
-    }
-
-    // 4. Copiar la PALABRA CLAVE (string) del usuario al kernel
-    lw->keyword = kstrndup_from_user(params_from_user.keyword, 64, GFP_KERNEL);
-    if (IS_ERR(lw->keyword)) {
-        kfree(lw->central_log);
-        kfree(lw);
-        return PTR_ERR(lw->keyword);
-    }
-
-    // 5. Asignar memoria para el array de estado de archivos
-    lw->files = kcalloc(lw->num_files, sizeof(struct file_state), GFP_KERNEL);
-    if (!lw->files) {
-        kfree(lw->central_log);
-        kfree(lw->keyword);
-        kfree(lw);
-        return -ENOMEM;
-    }
-
-    // 6. Copiar CADA RUTA DE ARCHIVO a monitorear
-    for (i = 0; i < lw->num_files; i++) {
-        char __user *user_path;
-        if (get_user(user_path, &params_from_user.files[i])) {
-            // Error, limpiar todo
-            goto cleanup_files;
-        }
-        lw->files[i].path = kstrndup_from_user(user_path, 256, GFP_KERNEL);
-        if (IS_ERR(lw->files[i].path)) {
-            // Error, limpiar todo
-            goto cleanup_files;
-        }
-        lw->files[i].pos = 0; // Posición inicial es 0
-    }
-
-    // 7. Inicializar y añadir a la lista global
-    mutex_init(&lw->lock);
-    lw->id = atomic_inc_return(&next_id);
-    lw->stop = false;
-
-    mutex_lock(&global_list_lock);
-    list_add_tail(&lw->list, &log_watch_list);
-    mutex_unlock(&global_list_lock);
-
-    // 8. Iniciar el hilo
-    lw->thread = kthread_run(watch_thread, lw, "log_watch_%d", lw->id);
-    if (IS_ERR(lw->thread)) {
-        // ... manejo de error ...
-        return PTR_ERR(lw->thread);
-    }
-
-    return lw->id;
-
-cleanup_files:
-    // Función de limpieza en caso de error durante el bucle
-    for (i = i - 1; i >= 0; i--) {
-        kfree(lw->files[i].path);
-    }
-    kfree(lw->files);
-    kfree(lw->central_log);
-    kfree(lw->keyword);
-    kfree(lw);
-    return -EFAULT;
+    kfree(buffer);
+    return ret;
 }
 
-SYSCALL_DEFINE1(stop_log_watch, int, id) {
-    struct log_watch *lw, *tmp;
-    int found = 0;
-    int i;
+// Busca la palabra clave en un buffer de texto
+static int contains_keyword(const char *line, size_t len, const char *keyword, size_t kwlen) {
+    if (len < kwlen) return 0;
+    for (size_t i = 0; i <= len - kwlen; i++) {
+        if (!memcmp(line + i, keyword, kwlen))
+            return 1;
+    }
+    return 0;
+}
 
-    mutex_lock(&global_list_lock);
-    // CORRECCIÓN: Usamos list_for_each_entry_safe para encontrar y eliminar en un solo paso
-    list_for_each_entry_safe(lw, tmp, &log_watch_list, list) {
-        if (lw->id == id) {
-            mutex_lock(&lw->lock);
-            if (!lw->stop) {
-                lw->stop = true;
-                kthread_stop(lw->thread); // Esto detiene el hilo y espera a que termine
+// Lee el archivo monitoreado y busca la palabra clave.
+static int monitor_file(struct thread_ctx *ctx, struct log_file *fw) {
+    loff_t size = i_size_read(file_inode(fw->file));
+    char *buffer;
+    ssize_t read_bytes;
 
-                // Liberar toda la memoria asignada
-                kfree(lw->central_log);
-                kfree(lw->keyword);
-                for (i = 0; i < lw->num_files; i++) {
-                    kfree(lw->files[i].path);
-                }
-                kfree(lw->files);
-                
-                list_del(&lw->list); // Quitar de la lista
-                kfree(lw); // Liberar la estructura principal
-                
-                found = 1;
-            }
-            mutex_unlock(&lw->lock); // Liberamos el mutex de la instancia
-            break; // Salimos del bucle
+    if (size <= fw->last_pos) return 0;
+
+    buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
+    if (!buffer) return -ENOMEM;
+
+    loff_t pos = fw->last_pos;
+    size_t to_read = min_t(size_t, PAGE_SIZE, size - pos);
+    
+    read_bytes = kernel_read(fw->file, buffer, to_read, &pos);
+    if (read_bytes > 0) {
+        if (contains_keyword(buffer, read_bytes, ctx->keyword, ctx->keyword_len)) {
+            write_to_central_log(ctx, fw->path, buffer, read_bytes);
         }
     }
-    mutex_unlock(&global_list_lock);
+    fw->last_pos = pos;
+    
+    kfree(buffer);
+    return 0;
+}
 
-    return found ? 0 : -EINVAL; // Retorna 0 si se encontró, o error si no
+// Añade un archivo a monitorear al contexto.
+static int add_watched_file(struct thread_ctx *ctx, const char *path) {
+    struct log_file *fw;
+    struct file *file;
+    
+    file = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(file)) return PTR_ERR(file);
+    
+    fw = kzalloc(sizeof(*fw), GFP_KERNEL);
+    if (!fw) {
+        fput(file);
+        return -ENOMEM;
+    }
+    
+    fw->file = file;
+    fw->path = kstrdup(path, GFP_KERNEL);
+    if (!fw->path) {
+        fput(file);
+        kfree(fw);
+        return -ENOMEM;
+    }
+    
+    fw->last_pos = i_size_read(file_inode(file));
+    list_add_tail(&fw->list, &ctx->files);
+    return 0;
+}
+
+// Libera toda la memoria y cierra los archivos asociados a un contexto.
+static void cleanup_context(struct thread_ctx *ctx) {
+    struct log_file *fw, *tmp;
+    
+    if (ctx->log_file) fput(ctx->log_file);
+    
+    list_for_each_entry_safe(fw, tmp, &ctx->files, list) {
+        list_del(&fw->list);
+        if (fw->file) fput(fw->file);
+        kfree(fw->path);
+        kfree(fw);
+    }
+    
+    kfree(ctx);
+}
+
+// Syscall para iniciar el monitoreo.
+SYSCALL_DEFINE3(start_log_watch,
+                const char __user *const __user *, paths,
+                const char __user *, log_path,
+                const char __user *, keyword) {
+    
+    struct thread_ctx *ctx;
+    char *k_keyword, *k_log_path;
+    char *k_paths[5] = {0};
+    int i, n_paths = 0;
+    int id, ret = 0;
+    
+    // 1. Copia los argumentos del usuario.
+    k_keyword = strndup_user(keyword, 128);
+    if (IS_ERR(k_keyword)) return PTR_ERR(k_keyword);
+    
+    k_log_path = strndup_user(log_path, PATH_MAX);
+    if (IS_ERR(k_log_path)) {
+        ret = PTR_ERR(k_log_path);
+        goto out_keyword;
+    }
+    
+    for (n_paths = 0; n_paths < 5; n_paths++) {
+        const char __user *user_path;
+        if (copy_from_user(&user_path, &paths[n_paths], sizeof(user_path))) {
+            ret = -EFAULT;
+            goto out_paths;
+        }
+        if (!user_path) break;
+        
+        k_paths[n_paths] = strndup_user(user_path, PATH_MAX);
+        if (IS_ERR(k_paths[n_paths])) {
+            ret = PTR_ERR(k_paths[n_paths]);
+            k_paths[n_paths] = NULL;
+            goto out_paths;
+        }
+    }
+    
+    if (n_paths == 0) {
+        ret = -EINVAL;
+        goto out_paths;
+    }
+    
+    // 2. Crea y configura el contexto de monitoreo.
+    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+    if (!ctx) {
+        ret = -ENOMEM;
+        goto out_paths;
+    }
+    
+    INIT_LIST_HEAD(&ctx->files);
+    mutex_init(&ctx->lock);
+    init_waitqueue_head(&ctx->waitq);
+    strscpy(ctx->keyword, k_keyword, 128);
+    ctx->keyword_len = strlen(ctx->keyword);
+    
+    ctx->log_file = filp_open(k_log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (IS_ERR(ctx->log_file)) {
+        ret = PTR_ERR(ctx->log_file);
+        ctx->log_file = NULL;
+        goto out_ctx;
+    }
+    
+    for (i = 0; i < n_paths; i++) {
+        ret = add_watched_file(ctx, k_paths[i]);
+        if (ret) goto out_ctx;
+    }
+    
+    // 3. Asigna un ID único y lo guarda en el IDR.
+    mutex_lock(&context_idr_lock);
+    id = idr_alloc(&context_idr, ctx, 1, 0, GFP_KERNEL);
+    mutex_unlock(&context_idr_lock);
+    
+    if (id < 0) {
+        ret = id;
+        goto out_ctx;
+    }
+    ctx->id = id;
+    
+    // 4. Lanza el hilo del kernel.
+    ctx->thread = kthread_run(monitor_thread, ctx, "log_watch_%u", id);
+    if (IS_ERR(ctx->thread)) {
+        ret = PTR_ERR(ctx->thread);
+        mutex_lock(&context_idr_lock);
+        idr_remove(&context_idr, id);
+        mutex_unlock(&context_idr_lock);
+        goto out_ctx;
+    }
+    
+    // 5. Libera la memoria temporal y retorna el ID.
+out_paths:
+    for (i = 0; i < n_paths; i++) kfree(k_paths[i]);
+    kfree(k_log_path);
+out_keyword:
+    kfree(k_keyword);
+    
+    if (ret) {
+        if (ctx) cleanup_context(ctx);
+        return ret;
+    }
+    
+    return ctx->id;
+
+out_ctx:
+    cleanup_context(ctx);
+    goto out_paths;
+}
+
+// Syscall para detener el monitoreo por ID.
+SYSCALL_DEFINE1(stop_log_watch, u32, id) {
+    struct thread_ctx *ctx;
+    
+    // 1. Busca el contexto usando el ID.
+    mutex_lock(&context_idr_lock);
+    ctx = idr_find(&context_idr, id);
+    if (!ctx) {
+        mutex_unlock(&context_idr_lock);
+        return -ESRCH; // Retorna si el ID no existe.
+    }
+    
+    // 2. Si ya está detenido, retorna un error.
+    if (READ_ONCE(ctx->stop)) {
+        mutex_unlock(&context_idr_lock);
+        return -EALREADY;
+    }
+    
+    // 3. Marca la bandera de detención y remueve el ID.
+    WRITE_ONCE(ctx->stop, true);
+    idr_remove(&context_idr, id);
+    mutex_unlock(&context_idr_lock);
+    
+    // 4. Despierta el hilo para que se detenga y libera los recursos.
+    wake_up_interruptible(&ctx->waitq);
+    if (ctx->thread) kthread_stop(ctx->thread);
+    
+    return 0;
 }
