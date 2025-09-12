@@ -103,8 +103,6 @@ detener_monitoreo() {
     sudo ./test_stop_log_watch "$id"
     if [ $? -ne 0 ]; then
         echo "Error al detener monitoreo con ID $id"
-    else
-        echo "Monitoreo detenido correctamente."
     fi
 }
 

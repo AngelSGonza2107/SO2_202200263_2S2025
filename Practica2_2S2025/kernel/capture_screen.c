@@ -23,7 +23,6 @@ struct capture_struct {
     __u32 height;            // Alto de la imagen
     __u32 bytes_per_row;     // Bytes por fila
     __u32 bytes_per_pixel;   // Bytes por pixel
-    __u32 drm_format;        // Formato DRM de la imagen
     __u32 total_bytes;       // Tamaño real de la captura
 };
 
@@ -138,15 +137,8 @@ SYSCALL_DEFINE1(capture_screen, struct capture_struct __user *, user_c_struct) {
     if (ret)
         return ret;
 
-    // Verifica si el formato del framebuffer es compatible
-    if (fb->modifier != DRM_FORMAT_MOD_LINEAR && fb->modifier != DRM_FORMAT_MOD_INVALID) {
-        drm_framebuffer_put(fb);
-        return -EOPNOTSUPP;
-    }
-
     u32 pitch = fb->pitches[0];
     u32 bpp = fb->format->cpp[0] * 8;
-    u32 format = fb->format->format;
     size_t total_bytes = (size_t)pitch * height;
 
     // Si el buffer de usuario es demasiado pequeño, se devuelve el tamaño requerido
@@ -155,7 +147,6 @@ SYSCALL_DEFINE1(capture_screen, struct capture_struct __user *, user_c_struct) {
         c_struct.height = height;
         c_struct.bytes_per_row = pitch;
         c_struct.bytes_per_pixel = bpp / 8;
-        c_struct.drm_format = format;
         c_struct.total_bytes = total_bytes;
         copy_to_user(user_c_struct, &c_struct, sizeof(c_struct));
         drm_framebuffer_put(fb);
@@ -195,7 +186,6 @@ SYSCALL_DEFINE1(capture_screen, struct capture_struct __user *, user_c_struct) {
     c_struct.height = height;
     c_struct.bytes_per_row = pitch;
     c_struct.bytes_per_pixel = bpp / 8;
-    c_struct.drm_format = format;
     c_struct.total_bytes = total_bytes;
     
     // Copia la estructura de vuelta al espacio de usuario

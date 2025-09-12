@@ -18,7 +18,6 @@ struct capture_struct {
     uint32_t height;
     uint32_t bytes_per_row;
     uint32_t bytes_per_pixel;
-    uint32_t drm_format;
     uint32_t total_bytes;
 };
 

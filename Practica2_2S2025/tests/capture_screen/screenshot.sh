@@ -15,6 +15,8 @@ echo -n "Presiona Enter y en 5 segundos se hará una captura..."
 read -r
 sleep 5
 
+echo ""
+
 # Ejecutar la captura
 RUTA_SALIDA="${CARPETA}/${NOMBRE}.png"
 $CAPTURADOR "$RUTA_SALIDA"

@@ -15,6 +15,7 @@ obj-y     = fork.o exec_domain.o panic.o \
 		send_key_event.o \
 		get_screen_resolution.o \
 		capture_screen.o \
+		ipc_channel.o \
 		log_watch.o
 
 obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
