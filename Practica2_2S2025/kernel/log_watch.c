@@ -147,22 +147,6 @@ static int add_watched_file(struct thread_ctx *ctx, const char *path) {
     return 0;
 }
 
-// Libera toda la memoria y cierra los archivos asociados a un contexto.
-static void cleanup_context(struct thread_ctx *ctx) {
-    struct log_file *fw, *tmp;
-    
-    if (ctx->log_file) fput(ctx->log_file);
-    
-    list_for_each_entry_safe(fw, tmp, &ctx->files, list) {
-        list_del(&fw->list);
-        if (fw->file) fput(fw->file);
-        kfree(fw->path);
-        kfree(fw);
-    }
-    
-    kfree(ctx);
-}
-
 // Syscall para iniciar el monitoreo.
 SYSCALL_DEFINE3(start_log_watch,
                 const char __user *const __user *, paths,
@@ -261,15 +245,21 @@ out_paths:
 out_keyword:
     kfree(k_keyword);
     
-    if (ret) {
-        if (ctx) cleanup_context(ctx);
-        return ret;
-    }
-    
     return ctx->id;
 
 out_ctx:
-    cleanup_context(ctx);
+    struct log_file *fw, *tmp;
+    
+    if (ctx->log_file) fput(ctx->log_file);
+    
+    list_for_each_entry_safe(fw, tmp, &ctx->files, list) {
+        list_del(&fw->list);
+        if (fw->file) fput(fw->file);
+        kfree(fw->path);
+        kfree(fw);
+    }
+    
+    kfree(ctx);
     goto out_paths;
 }
 
