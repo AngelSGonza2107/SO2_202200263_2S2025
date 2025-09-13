@@ -93,7 +93,7 @@ retry:
     drm_for_each_plane(plane, drm) {
         if (plane->type == DRM_PLANE_TYPE_PRIMARY && plane->state &&
             plane->state->fb && plane->state->crtc == crtc) {
-            // Se encontró el framebuffer primario
+            // Si se encuentra el framebuffer primario
             drm_framebuffer_get(plane->state->fb);
             *crtc_out = crtc;
             *fb_out = plane->state->fb;

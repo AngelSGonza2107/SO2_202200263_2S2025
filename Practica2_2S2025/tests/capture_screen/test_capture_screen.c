@@ -90,7 +90,7 @@ int main(int argc, char **argv) {
     // Extrae los metadatos de la imagen para preparar el buffer que se enviará a la syscall
     uint32_t w = c_struct.width, h = c_struct.height, pitch = c_struct.bytes_per_row, bpp = c_struct.bytes_per_pixel;
     if (w == 0 || h == 0 || pitch == 0 || (bpp != 24 && bpp != 32)) {
-        fprintf(stderr, "Metadatos inválidos: %ux%u pitch=%u bpp=%u\n", w, h, pitch, bpp);
+        fprintf(stderr, "Metadatos inválidos");
         return 1;
     }
 
