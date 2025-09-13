@@ -9,11 +9,11 @@
 #include <linux/kthread.h>
 #include <linux/wait.h>
 #include <linux/string.h>
-#include <linux/idr.h>
 
-// IDR y mutex para gestionar los contextos de monitoreo
-static DEFINE_IDR(context_idr);
-static DEFINE_MUTEX(context_idr_lock);
+static DEFINE_MUTEX(context_list_lock);
+static LIST_HEAD(context_list);
+
+static atomic_t id_counter = ATOMIC_INIT(1);
 
 // Estructura que representa un archivo a monitorear
 // Esto con el fin de poder leer varios archivos en un solo contexto
@@ -33,6 +33,7 @@ struct log_file {
 // Finalmente un ID único id
 struct thread_ctx {
     u32 id;
+    struct list_head list;
     struct list_head files;
     struct mutex lock;
     struct task_struct *thread;
@@ -230,10 +231,12 @@ SYSCALL_DEFINE3(start_log_watch,
         if (ret) goto out_ctx;
     }
     
-    // 3. Asigna un ID único y lo guarda en el IDR.
-    mutex_lock(&context_idr_lock);
-    id = idr_alloc(&context_idr, ctx, 1, 0, GFP_KERNEL);
-    mutex_unlock(&context_idr_lock);
+    // 3. Asigna un ID único y lo guarda
+    ctx->id = atomic_fetch_add(1, &id_counter);
+
+    mutex_lock(&context_list_lock);
+    list_add_tail(&ctx->list, &context_list);
+    mutex_unlock(&context_list_lock);
     
     if (id < 0) {
         ret = id;
@@ -245,9 +248,9 @@ SYSCALL_DEFINE3(start_log_watch,
     ctx->thread = kthread_run(monitor_thread, ctx, "log_watch_%u", id);
     if (IS_ERR(ctx->thread)) {
         ret = PTR_ERR(ctx->thread);
-        mutex_lock(&context_idr_lock);
-        idr_remove(&context_idr, id);
-        mutex_unlock(&context_idr_lock);
+        mutex_lock(&context_list_lock);
+        list_del(&ctx->list);
+        mutex_unlock(&context_list_lock);
         goto out_ctx;
     }
     
@@ -275,23 +278,30 @@ SYSCALL_DEFINE1(stop_log_watch, u32, id) {
     struct thread_ctx *ctx;
     
     // 1. Busca el contexto usando el ID.
-    mutex_lock(&context_idr_lock);
-    ctx = idr_find(&context_idr, id);
+    mutex_lock(&context_list_lock);
+    list_for_each_entry(ctx, &context_list, list) {
+        if (ctx->id == id)
+            break;
+    }
+    if (&ctx->list == &context_list) {
+        mutex_unlock(&context_list_lock);
+        return -ESRCH;
+    }
     if (!ctx) {
-        mutex_unlock(&context_idr_lock);
+        mutex_unlock(&context_list_lock);
         return -ESRCH; // Retorna si el ID no existe.
     }
     
     // 2. Si ya está detenido, retorna un error.
     if (READ_ONCE(ctx->stop)) {
-        mutex_unlock(&context_idr_lock);
+        mutex_unlock(&context_list_lock);
         return -EALREADY;
     }
     
     // 3. Marca la bandera de detención y remueve el ID.
     WRITE_ONCE(ctx->stop, true);
-    idr_remove(&context_idr, id);
-    mutex_unlock(&context_idr_lock);
+    list_del(&ctx->list);
+    mutex_unlock(&context_list_lock);
     
     // 4. Despierta el hilo para que se detenga y libera los recursos.
     wake_up_interruptible(&ctx->waitq);
